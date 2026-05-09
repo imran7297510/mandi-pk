@@ -1,0 +1,187 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitives
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email.lower() == "imran7297510@gmail.com" ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        exists(/databases/$(database)/documents/authorizedAdmins/$(request.auth.token.email.lower()))
+      ) && request.auth.token.email_verified == true;
+    }
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    match /authorizedAdmins/{adminEmail} {
+      allow read: if isSignedIn() && (request.auth.token.email.lower() == adminEmail.lower() || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /faqs/{faqId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false; // Only manageable through Firebase Console or restricted logic
+    }
+
+    match /reports/{reportId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /profileReports/{reportId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /supportTickets/{ticketId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /listings/{listingId} {
+      function isValidListing(data) {
+        return data.keys().hasAll(["title", "description", "category", "price", "images", "sellerName", "phoneNumber", "quantity", "shippingCharges", "status", "ownerId", "createdAt", "updatedAt"])
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.description is string && data.description.size() <= 5000
+          && data.category is string && data.price is number && data.price >= 0
+          && data.quantity is number && data.quantity >= 0
+          && data.shippingCharges is number && data.shippingCharges >= 0
+          && data.images is list && data.images.size() > 0 && data.images.size() <= 10
+          && data.sellerName is string && data.sellerName.size() > 0 && data.sellerName.size() <= 100
+          && data.phoneNumber is string && data.phoneNumber.size() > 0 && data.phoneNumber.size() <= 30
+          && data.status is string && data.status in ["LIVE", "BOOKED", "SHIPPED", "PAID", "SOLD"]
+          && data.ownerId is string;
+      }
+
+      allow read: if true;
+
+      allow create: if isSignedIn()
+        && isValidListing(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().status == "LIVE";
+
+      allow update: if (isAdmin() && isValidListing(incoming())) ||
+        (isSignedIn() && existing().ownerId == request.auth.uid
+          && isValidListing(incoming())
+          && incoming().ownerId == existing().ownerId
+          && (
+            // Full update for owner
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'description', 'category', 'subcategory', 'condition', 
+              'price', 'quantity', 'shippingCharges', 'images', 'sellerName', 
+              'phoneNumber', 'whatsappNumber', 'address', 'updatedAt', 'status',
+              'promotionStatus', 'promotionType', 'promotionProofImage', 'isFeatured', 'isBoosted', 'views', 'locationArea'
+            ])
+            // Prevent self-approving promotions
+            && (incoming().promotionStatus == existing().get('promotionStatus', 'NONE') || isAdmin())
+            && (incoming().isFeatured == existing().get('isFeatured', false) || isAdmin())
+          )) ||
+        (
+          // Allow tracking views
+          incoming().diff(existing()).affectedKeys().hasOnly(['views']) &&
+          incoming().views == existing().get('views', 0) + 1
+        ) ||
+        (
+          // Allow buyers to update stock and status during booking
+          isSignedIn() && 
+          isValidListing(incoming()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'status', 'updatedAt']) &&
+          incoming().quantity < existing().quantity &&
+          incoming().quantity >= 0 &&
+          incoming().updatedAt == request.time
+        );
+
+      allow delete: if isAdmin() || (isSignedIn() && existing().ownerId == request.auth.uid);
+    }
+
+    match /promotionRequests/{requestId} {
+      function isValidPromotion(data) {
+        return data.keys().hasAll(['userId', 'targetId', 'type', 'planName', 'amount', 'paymentProofImage', 'status', 'durationDays', 'createdAt', 'updatedAt'])
+           && data.userId == request.auth.uid
+           && data.type is string && data.type in ['FEATURED', 'BOOST', 'VERIFIED']
+           && data.status is string && data.status == 'PENDING'
+           && data.amount is number && data.amount > 0
+           && data.durationDays is number && data.durationDays > 0
+           && data.paymentProofImage is string;
+      }
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && isValidPromotion(incoming()) && incoming().createdAt == request.time;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.auth.uid == userId
+                    && incoming().createdAt == request.time;
+      allow update: if (isSignedIn() && request.auth.uid == userId
+                        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'phoneNumber', 'city', 'address', 'updatedAt', 'referralCount'])
+                    ) || isAdmin();
+    }
+
+    match /orders/{orderId} {
+      function isValidOrder(data) {
+        return data.keys().hasAll(['listingId', 'listingTitle', 'listingImage', 'buyerId', 'sellerId', 'quantity', 'unitPrice', 'shippingCharges', 'totalAmount', 'status', 'buyerName', 'buyerAddress', 'buyerContact', 'createdAt', 'updatedAt'])
+          && data.quantity is number && data.quantity > 0
+          && data.status in ["BOOKED", "SHIPPED", "PAID", "SOLD"];
+      }
+
+      allow read: if isSignedIn() && (resource.data.buyerId == request.auth.uid || resource.data.sellerId == request.auth.uid || isAdmin());
+      
+      allow create: if isSignedIn()
+        && isValidOrder(incoming())
+        && incoming().buyerId == request.auth.uid
+        && incoming().status == "BOOKED"
+        && incoming().createdAt == request.time;
+
+      allow update: if isSignedIn()
+        && (existing().buyerId == request.auth.uid || existing().sellerId == request.auth.uid || isAdmin())
+        && (
+          // Seller can mark as shipped and sold
+          (existing().sellerId == request.auth.uid && incoming().status in ["SHIPPED", "SOLD"]) ||
+          // Buyer can mark as paid
+          (existing().buyerId == request.auth.uid && incoming().status == "PAID") ||
+          isAdmin()
+        )
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn(); // Basic, should refine based on trigger
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /chats/{chatId} {
+      allow read: if isSignedIn() && (resource.data.buyerId == request.auth.uid || resource.data.sellerId == request.auth.uid);
+      allow create: if isSignedIn() && incoming().buyerId == request.auth.uid;
+      allow update: if isSignedIn() && (existing().buyerId == request.auth.uid || existing().sellerId == request.auth.uid);
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && incoming().senderId == request.auth.uid;
+      }
+    }
+  }
+}
